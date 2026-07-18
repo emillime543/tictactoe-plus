@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>TicTacToe+ v1.8</title>
+<title>TicTacToe+ v1.9</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body {
@@ -127,7 +127,7 @@
 </head>
 <body>
 
-<h1>TicTacToe+ <span style="font-size:0.55rem;color:#555;letter-spacing:0.05em;vertical-align:middle;">v1.8</span></h1>
+<h1>TicTacToe+ <span style="font-size:0.55rem;color:#555;letter-spacing:0.05em;vertical-align:middle;">v1.9</span></h1>
 <p class="subtitle" id="subtitle">2 Spieler · lokal</p>
 
 <p id="activePlayersText" style="font-size:0.72rem;color:#666;letter-spacing:0.04em;margin-bottom:6px;min-height:16px;"></p>
@@ -837,23 +837,21 @@ async function tryMatch() {
     const queueRef = db.ref(QUEUE_PATH);
 
     // Step 1: try to atomically claim ANY existing entry that is not our own.
-    // We do this by reading the queue once, then using a per-entry transaction
-    // on that specific candidate's node — this guarantees only one claimant
-    // can succeed, and avoids the self-matching ambiguity of a queue-wide
-    // transaction that also has to write its own entry.
     const snap = await queueRef.get();
     const queue = snap.val() || {};
+    console.log('[matchmaking] queue snapshot:', queue);
     const candidates = Object.entries(queue).filter(([id]) => id !== myId);
     candidates.sort((a,b) => Math.abs(a[1].elo-myElo) - Math.abs(b[1].elo-myElo));
+    console.log('[matchmaking] candidates found:', candidates.length);
 
     for (const [oppId, oppData] of candidates) {
+      console.log('[matchmaking] attempting to claim', oppId);
       const claimTx = await queueRef.child(oppId).transaction(cur => {
-        if (cur === null) return; // already claimed by someone else, abort
+        if (cur === null || cur === undefined) return undefined; // nothing to claim, abort
         return null; // claim it: remove from queue
-      });
-      if (claimTx.committed && claimTx.snapshot.val() === null) {
-        // We might have raced with the entry simply not existing; verify
-        // we actually had data before (oppData was non-null from our read).
+      }, undefined, false); // applyLocally=false forces server round-trip, avoids stale local cache
+      console.log('[matchmaking] claim result:', claimTx.committed, claimTx.snapshot.val());
+      if (claimTx.committed) {
         myPlayer='O'; roomId=oppData.roomId;
         currentOpponentId = oppData.deviceId || oppId;
         rematchCount = 1;
@@ -866,7 +864,7 @@ async function tryMatch() {
         listenToRoom(roomId, oppData.elo, oppData.name);
         return;
       }
-      // Claim failed (someone else got there first) — try next candidate
+      // Claim failed (someone else got there first, or entry already gone) — try next candidate
     }
 
     // Step 2: no claimable candidate — become the host and wait.
@@ -890,12 +888,14 @@ async function tryMatch() {
       const q2 = snap2.val() || {};
       const others = Object.entries(q2).filter(([id]) => id !== myId);
       others.sort((a,b) => Math.abs(a[1].elo-myElo) - Math.abs(b[1].elo-myElo));
+      console.log('[matchmaking widen] others found:', others.length);
       for (const [oppId, oppData] of others) {
         const claimTx = await queueRef.child(oppId).transaction(cur => {
-          if (cur === null) return;
+          if (cur === null || cur === undefined) return undefined;
           return null;
-        });
-        if (claimTx.committed && claimTx.snapshot.val() === null) {
+        }, undefined, false);
+        console.log('[matchmaking widen] claim result:', claimTx.committed, claimTx.snapshot.val());
+        if (claimTx.committed) {
           // Successfully claimed someone else while we were waiting —
           // abandon our own host room and join theirs instead.
           if (searchingRef) { await searchingRef.remove().catch(()=>{}); }
