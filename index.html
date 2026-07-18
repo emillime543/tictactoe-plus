@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>TicTacToe+ v1.7</title>
+<title>TicTacToe+ v1.8</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body {
@@ -127,7 +127,7 @@
 </head>
 <body>
 
-<h1>TicTacToe+ <span style="font-size:0.55rem;color:#555;letter-spacing:0.05em;vertical-align:middle;">v1.7</span></h1>
+<h1>TicTacToe+ <span style="font-size:0.55rem;color:#555;letter-spacing:0.05em;vertical-align:middle;">v1.8</span></h1>
 <p class="subtitle" id="subtitle">2 Spieler · lokal</p>
 
 <p id="activePlayersText" style="font-size:0.72rem;color:#666;letter-spacing:0.04em;margin-bottom:6px;min-height:16px;"></p>
@@ -834,62 +834,47 @@ async function startMatchmaking() {
 async function tryMatch() {
   const myId = deviceId;
   try {
-    // Use a transaction on the queue to atomically claim a waiting opponent
-    // or register ourselves as the waiter. This prevents the race condition
-    // where two players click "search" simultaneously and both become hosts.
     const queueRef = db.ref(QUEUE_PATH);
-    let claimedOppId = null;
-    let claimedOppData = null;
-    const myRoomId = 'room_'+myId+'_'+Date.now();
 
-    const txResult = await queueRef.transaction(current => {
-      // Reset per-attempt state — Firebase may invoke this callback multiple
-      // times on contention, so nothing here may leak between attempts except
-      // via the return value itself.
-      claimedOppId = null; claimedOppData = null;
-      const entries = Object.entries(current || {}).filter(([id]) => id !== myId);
-      if (entries.length > 0) {
-        entries.sort((a,b) => Math.abs(a[1].elo-myElo) - Math.abs(b[1].elo-myElo));
-        const [oppId, oppData] = entries[0];
-        claimedOppId = oppId; claimedOppData = oppData;
-        const updated = { ...(current || {}) };
-        delete updated[oppId];
-        return updated;
-      }
-      const updated = { ...(current || {}) };
-      updated[myId] = { name: myName, elo: myElo, deviceId: myId,
-        roomId: myRoomId, allowMove: allowMove, ts: Date.now() };
-      return updated;
-    });
+    // Step 1: try to atomically claim ANY existing entry that is not our own.
+    // We do this by reading the queue once, then using a per-entry transaction
+    // on that specific candidate's node — this guarantees only one claimant
+    // can succeed, and avoids the self-matching ambiguity of a queue-wide
+    // transaction that also has to write its own entry.
+    const snap = await queueRef.get();
+    const queue = snap.val() || {};
+    const candidates = Object.entries(queue).filter(([id]) => id !== myId);
+    candidates.sort((a,b) => Math.abs(a[1].elo-myElo) - Math.abs(b[1].elo-myElo));
 
-    if (!txResult.committed) {
-      document.getElementById('mpStatus').innerHTML=`<span style="color:#ff6a6a">⚠️ ${t('mpRetry')}</span>`;
-      return;
-    }
-
-    // Read the FINAL committed queue state to determine our actual role,
-    // since the transaction callback may have run multiple times.
-    const finalQueue = txResult.snapshot.val() || {};
-    const iAmStillInQueue = !!finalQueue[myId];
-
-    if (!iAmStillInQueue && claimedOppId && claimedOppData) {
-      // We successfully claimed an opponent -> we are the guest (O)
-      myPlayer='O'; roomId=claimedOppData.roomId;
-      currentOpponentId = claimedOppData.deviceId || claimedOppId;
-      rematchCount = 1;
-      if (claimedOppData.allowMove !== undefined && claimedOppData.allowMove !== allowMove) {
-        document.getElementById('mpStatus').innerHTML =
-          `<span style="color:#ff6a6a">⚠️ ${t('ruleMismatch')}</span>`;
-        setTimeout(()=>showMpOverlay(false), 2000);
+    for (const [oppId, oppData] of candidates) {
+      const claimTx = await queueRef.child(oppId).transaction(cur => {
+        if (cur === null) return; // already claimed by someone else, abort
+        return null; // claim it: remove from queue
+      });
+      if (claimTx.committed && claimTx.snapshot.val() === null) {
+        // We might have raced with the entry simply not existing; verify
+        // we actually had data before (oppData was non-null from our read).
+        myPlayer='O'; roomId=oppData.roomId;
+        currentOpponentId = oppData.deviceId || oppId;
+        rematchCount = 1;
+        if (oppData.allowMove !== undefined && oppData.allowMove !== allowMove) {
+          document.getElementById('mpStatus').innerHTML =
+            `<span style="color:#ff6a6a">⚠️ ${t('ruleMismatch')}</span>`;
+          setTimeout(()=>showMpOverlay(false), 2000);
+          return;
+        }
+        listenToRoom(roomId, oppData.elo, oppData.name);
         return;
       }
-      listenToRoom(roomId, claimedOppData.elo, claimedOppData.name);
-      return;
+      // Claim failed (someone else got there first) — try next candidate
     }
 
-    // We are the host (X) — our own entry is in the final queue
+    // Step 2: no claimable candidate — become the host and wait.
+    const myRoomId = 'room_'+myId+'_'+Date.now();
     myPlayer='X'; roomId=myRoomId;
     searchingRef = queueRef.child(myId);
+    await searchingRef.set({ name: myName, elo: myElo, deviceId: myId,
+      roomId: myRoomId, allowMove: allowMove, ts: Date.now() });
     const initState = serializeState();
     initState.status = 'waiting';
     initState.hostName = myName; initState.hostElo = myElo; initState.hostDeviceId = deviceId;
@@ -901,27 +886,26 @@ async function tryMatch() {
     // After 5 seconds, if still waiting, widen search to accept ANY opponent
     mmTimer = setTimeout(async () => {
       if (!roomRef) return; // already matched/left
-      let widenOppId = null, widenOppData = null;
-      const tx2 = await queueRef.transaction(current => {
-        widenOppId = null; widenOppData = null;
-        const entries = Object.entries(current || {}).filter(([id]) => id !== myId);
-        if (entries.length > 0) {
-          entries.sort((a,b) => Math.abs(a[1].elo-myElo) - Math.abs(b[1].elo-myElo));
-          const [oppId, oppData] = entries[0];
-          widenOppId = oppId; widenOppData = oppData;
-          const updated = { ...(current || {}) };
-          delete updated[oppId];
-          delete updated[myId];
-          return updated;
+      const snap2 = await queueRef.get();
+      const q2 = snap2.val() || {};
+      const others = Object.entries(q2).filter(([id]) => id !== myId);
+      others.sort((a,b) => Math.abs(a[1].elo-myElo) - Math.abs(b[1].elo-myElo));
+      for (const [oppId, oppData] of others) {
+        const claimTx = await queueRef.child(oppId).transaction(cur => {
+          if (cur === null) return;
+          return null;
+        });
+        if (claimTx.committed && claimTx.snapshot.val() === null) {
+          // Successfully claimed someone else while we were waiting —
+          // abandon our own host room and join theirs instead.
+          if (searchingRef) { await searchingRef.remove().catch(()=>{}); }
+          await db.ref(`${ROOMS_PATH}/${roomId}`).remove();
+          if (roomListener && roomRef) { roomRef.off('value', roomListener); roomListener=null; }
+          myPlayer='O'; roomId=oppData.roomId;
+          currentOpponentId = oppData.deviceId || oppId;
+          listenToRoom(oppData.roomId, oppData.elo, oppData.name);
+          return;
         }
-        return current;
-      });
-      if (tx2.committed && widenOppId && widenOppData) {
-        await db.ref(`${ROOMS_PATH}/${roomId}`).remove();
-        if (roomListener && roomRef) { roomRef.off('value', roomListener); roomListener=null; }
-        myPlayer='O'; roomId=widenOppData.roomId;
-        currentOpponentId = widenOppData.deviceId || widenOppId;
-        listenToRoom(widenOppData.roomId, widenOppData.elo, widenOppData.name);
       }
     }, 5000);
   } catch(e) {
