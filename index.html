@@ -189,6 +189,10 @@
 </div>
 
 <button class="btn" id="surrenderBtn" style="display:none;background:#ff6a6a;margin-bottom:10px;" data-t="surrender">Aufgeben</button>
+<div class="row" id="rematchRow" style="display:none;justify-content:center;">
+  <button class="btn" id="rematchBtn" data-t="rematch">Nochmal</button>
+  <button class="btn" id="endMatchBtn" style="background:#1a1a2e;border:1px solid #2a2a4a;color:#aaa;" data-t="endGame">Beenden</button>
+</div>
 <button class="btn" id="resetBtn" data-t="newGame">Neues Spiel</button>
 <button class="btn" id="rulesBtn" style="margin-top:10px;background:#1a1a2e;border:1px solid #2a2a4a;color:#aaa;font-size:0.82rem;padding:9px 24px;">📖 <span data-t="rulesBtn"></span></button>
 <button class="btn" id="leaderboardBtn" style="margin-top:10px;background:#1a1a2e;border:1px solid #2a2a4a;color:#aaa;font-size:0.82rem;padding:9px 24px;">🏆 <span data-t="leaderboardBtn"></span></button>
@@ -349,6 +353,9 @@ let searchingRef=null;
 let roomRef=null;
 let roomListener=null;
 let disconnectRef=null;
+let currentOpponentId=null;  // deviceId of current online opponent
+let rematchCount=0;          // games played vs currentOpponentId this session
+const MAX_REMATCHES=3;
 
 // ── Init ──────────────────────────────────────────────────────────────────────
 function initGame() {
@@ -502,7 +509,7 @@ function checkEndOfTurn() {
     else if(vsAI){ current==='O'?playLose():playWin(); }
     else playWin();
     renderBoard(); renderScores();
-    if(vsOnline) setTimeout(leaveRoom,4000);
+    if(vsOnline) showGameEndUI();
     return;
   }
   const next=current==='X'?'O':'X';
@@ -511,7 +518,7 @@ function checkEndOfTurn() {
       gameOver=true; scores.D++; playDraw();
       document.getElementById('status').textContent=t('drawMsg');
       renderScores();
-      if(vsOnline) setTimeout(leaveRoom,4000);
+      if(vsOnline) showGameEndUI();
       return;
     }
     const skipName=vsOnline?(next===myPlayer?t('you'):t('opponent'))
@@ -836,6 +843,8 @@ async function tryMatch() {
       candidates.sort((a,b) => Math.abs(a[1].elo-myElo) - Math.abs(b[1].elo-myElo));
       const [oppId, oppData] = candidates[0];
       const rId = oppData.roomId;
+      currentOpponentId = oppData.deviceId || oppId;
+      rematchCount = 1;
       await db.ref(`${QUEUE_PATH}/${oppId}`).remove();
       myPlayer='O'; roomId=rId;
       listenToRoom(rId, oppData.elo, oppData.name);
@@ -846,12 +855,12 @@ async function tryMatch() {
     const rId = 'room_' + myId + '_' + Date.now();
     myPlayer='X'; roomId=rId;
     searchingRef = db.ref(`${QUEUE_PATH}/${myId}`);
-    await searchingRef.set({ name: myName, elo: myElo, roomId: rId, ts: firebase.database.ServerValue.TIMESTAMP });
+    await searchingRef.set({ name: myName, elo: myElo, roomId: rId, deviceId: deviceId, ts: firebase.database.ServerValue.TIMESTAMP });
     const initState = serializeState();
     initState.status = 'waiting';
-    initState.hostName = myName; initState.hostElo = myElo;
+    initState.hostName = myName; initState.hostElo = myElo; initState.hostDeviceId = deviceId;
     await db.ref(`${ROOMS_PATH}/${rId}`).set(initState);
-    oppName = ''; oppElo = 1000;
+    oppName = ''; oppElo = 1000; currentOpponentId = null; rematchCount = 1;
     listenToRoom(rId, null, null);
 
     // After 5 seconds, if still waiting, widen search (re-check queue once more,
@@ -948,11 +957,22 @@ function listenToRoom(rId, knownOppElo, knownOppName) {
       if (myPlayer === 'X') {
         if (data.guestElo != null) oppElo = data.guestElo;
         if (data.guestName) oppName = data.guestName;
+        if (data.guestDeviceId) currentOpponentId = data.guestDeviceId;
       } else {
         if (data.hostElo != null) oppElo = data.hostElo;
         if (data.hostName) oppName = data.hostName;
+        if (data.hostDeviceId) currentOpponentId = data.hostDeviceId;
       }
       updateScoreboardNames();
+
+      // If a fresh rematch round just started (status playing, no lastMove yet,
+      // gameOver was previously true), reset the end-of-game UI back to "in progress"
+      if (data.status === 'playing' && !data.lastMove && gameOver) {
+        gameOver = false;
+        document.getElementById('rematchRow').style.display='none';
+        document.getElementById('surrenderBtn').style.display='block';
+        if (myPlayer === 'O') rematchCount++;
+      }
 
       const prevLastMove = data.lastMove;
       deserializeState(data);
@@ -971,7 +991,7 @@ function listenToRoom(rId, knownOppElo, knownOppName) {
             `<span style="color:${color};font-weight:bold">${sym} ${t('opponent')}</span>${t('wins')}`;
           playLose(); renderBoard(); renderScores();
           applyEloResult(0);
-          setTimeout(leaveRoom, 4000);
+          showGameEndUI();
         }
       }
     }
@@ -984,7 +1004,8 @@ function listenToRoom(rId, knownOppElo, knownOppName) {
     roomRef.update({
       status:'playing',
       guestName: myName,
-      guestElo: myElo
+      guestElo: myElo,
+      guestDeviceId: deviceId
     });
     hideMpOverlay();
   }
@@ -1028,7 +1049,7 @@ function pushOnlineMove(move) {
     playWin(); renderScores();
     applyEloResult(move.player===myPlayer ? 1 : 0);
     roomRef.update(state);
-    setTimeout(leaveRoom, 4000);
+    showGameEndUI();
     return;
   }
   roomRef.update(state);
@@ -1041,11 +1062,57 @@ function leaveRoom() {
   if (roomRef) { roomRef.remove(); roomRef=null; }
   if (searchingRef) { searchingRef.remove(); searchingRef=null; }
   vsOnline=false; myPlayer=null; roomId=null;
+  currentOpponentId=null; rematchCount=0;
   document.getElementById('btn-2p').classList.add('active');
   document.getElementById('btn-online').classList.remove('active');
   document.getElementById('surrenderBtn').style.display='none';
+  document.getElementById('resetBtn').style.display='block';
+  document.getElementById('rematchRow').style.display='none';
   resetScores(); firstPlayer='X'; initGame(); applyLang();
 }
+
+// ── Game end UI (online): offer rematch instead of auto-leaving ────────────────
+function showGameEndUI() {
+  document.getElementById('surrenderBtn').style.display='none';
+  document.getElementById('resetBtn').style.display='block';
+  const row = document.getElementById('rematchRow');
+  const rematchBtn = document.getElementById('rematchBtn');
+  if (rematchCount >= MAX_REMATCHES) {
+    rematchBtn.style.display = 'none';
+  } else {
+    rematchBtn.style.display = 'inline-block';
+    rematchBtn.textContent = `${t('rematch')} (${rematchCount}/${MAX_REMATCHES})`;
+  }
+  row.style.display = 'flex';
+}
+
+function startRematch() {
+  if (!roomRef || rematchCount >= MAX_REMATCHES) return;
+  rematchCount++;
+  document.getElementById('rematchRow').style.display='none';
+  document.getElementById('surrenderBtn').style.display='block';
+
+  // Host (X) resets the shared board state; alternate who starts each rematch
+  firstPlayer = firstPlayer === 'X' ? 'O' : 'X';
+  board = Array.from({length:9},()=>[]);
+  reserve = { X:{small:3,medium:3,large:2}, O:{small:3,medium:3,large:2} };
+  current = firstPlayer;
+  gameOver = false; selected = null;
+  renderAll();
+
+  if (myPlayer === 'X') {
+    roomRef.update({
+      status: 'playing',
+      board: board.map(stack => stack.map(p=>({player:p.player,size:p.size}))),
+      reserve: JSON.parse(JSON.stringify(reserve)),
+      current, firstPlayer, allowMove,
+      lastMove: null
+    });
+  }
+}
+
+document.getElementById('rematchBtn').addEventListener('click', startRematch);
+document.getElementById('endMatchBtn').addEventListener('click', leaveRoom);
 
 // ── Board clicks ──────────────────────────────────────────────────────────────
 document.getElementById('board').addEventListener('click', e=>{
@@ -1075,6 +1142,7 @@ document.getElementById('btn-2p').addEventListener('click',()=>{
   document.getElementById('btn-online').classList.remove('active');
   document.getElementById('diff-row').style.display='none';
   document.getElementById('surrenderBtn').style.display='none';
+  document.getElementById('resetBtn').style.display='block';
   resetScores(); firstPlayer='X'; initGame(); applyLang();
 });
 document.getElementById('btn-ai').addEventListener('click',()=>{
@@ -1085,6 +1153,7 @@ document.getElementById('btn-ai').addEventListener('click',()=>{
   document.getElementById('btn-online').classList.remove('active');
   document.getElementById('diff-row').style.display='flex';
   document.getElementById('surrenderBtn').style.display='none';
+  document.getElementById('resetBtn').style.display='block';
   resetScores(); firstPlayer='X'; initGame(); applyLang();
 });
 document.getElementById('btn-online').addEventListener('click', ()=>{
@@ -1094,6 +1163,7 @@ document.getElementById('btn-online').addEventListener('click', ()=>{
   document.getElementById('btn-ai').classList.remove('active');
   document.getElementById('diff-row').style.display='none';
   document.getElementById('surrenderBtn').style.display='block';
+  document.getElementById('resetBtn').style.display='none';
   resetScores(); firstPlayer='X'; initGame();
   showMpOverlay(false);
 });
@@ -1222,6 +1292,8 @@ const T={
     surrender:'Aufgeben',
     youSurrendered:'Du hast aufgegeben.',
     opponentSurrendered:'Gegner hat aufgegeben. Du gewinnst!',
+    rematch:'Nochmal',
+    endGame:'Beenden',
     nameTitle:'👤 Dein Spielername',
     nameDesc:'Wird für die Weltrangliste verwendet und auf diesem Gerät gespeichert.',
     nameConfirm:'Bestätigen',
@@ -1264,6 +1336,8 @@ const T={
     surrender:'Surrender',
     youSurrendered:'You surrendered.',
     opponentSurrendered:'Opponent surrendered. You win!',
+    rematch:'Rematch',
+    endGame:'End',
     nameTitle:'👤 Your Player Name',
     nameDesc:'Used for the world leaderboard and saved on this device.',
     nameConfirm:'Confirm',
