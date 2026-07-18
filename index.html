@@ -978,13 +978,13 @@ function listenToRoom(rId, knownOppElo, knownOppName) {
   });
 
   if (myPlayer === 'O') {
+    // IMPORTANT: only announce our identity — never overwrite the host's
+    // board/current/firstPlayer, since that state was already correctly
+    // initialized by the host (X) when the room was created.
     roomRef.update({
       status:'playing',
       guestName: myName,
-      guestElo: myElo,
-      board: board.map(stack => stack.map(p=>({player:p.player,size:p.size}))),
-      reserve: JSON.parse(JSON.stringify(reserve)),
-      current, firstPlayer, allowMove
+      guestElo: myElo
     });
     hideMpOverlay();
   }
