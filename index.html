@@ -188,6 +188,7 @@
   </div>
 </div>
 
+<button class="btn" id="surrenderBtn" style="display:none;background:#ff6a6a;margin-bottom:10px;" data-t="surrender">Aufgeben</button>
 <button class="btn" id="resetBtn" data-t="newGame">Neues Spiel</button>
 <button class="btn" id="rulesBtn" style="margin-top:10px;background:#1a1a2e;border:1px solid #2a2a4a;color:#aaa;font-size:0.82rem;padding:9px 24px;">📖 <span data-t="rulesBtn"></span></button>
 <button class="btn" id="leaderboardBtn" style="margin-top:10px;background:#1a1a2e;border:1px solid #2a2a4a;color:#aaa;font-size:0.82rem;padding:9px 24px;">🏆 <span data-t="leaderboardBtn"></span></button>
@@ -216,6 +217,10 @@
 <div class="mp-overlay" id="mpOverlay">
   <div class="mp-box">
     <h2 id="mpTitle">🌐 Online Multiplayer</h2>
+    <div class="row" id="mpMoveRow" style="justify-content:center;margin-bottom:14px;">
+      <button class="toggle-btn" id="mp-btn-nomove">🔒 <span data-t="fixed"></span></button>
+      <button class="toggle-btn active" id="mp-btn-move">🔄 <span data-t="movable"></span></button>
+    </div>
     <div class="mp-status" id="mpStatus"></div>
     <button class="btn" id="mpSearchBtn" style="width:100%">🔍 Spiel suchen</button>
     <button class="mp-cancel" id="mpCancelBtn">Abbrechen</button>
@@ -920,6 +925,17 @@ function listenToRoom(rId, knownOppElo, knownOppName) {
       hideMpOverlay(); return;
     }
 
+    if (data.surrendered && data.surrendered !== myPlayer) {
+      if (!gameOver) {
+        gameOver=true; scores[myPlayer]++;
+        document.getElementById('status').innerHTML=`<span class="hx">🏳️🏆</span> ${t('opponentSurrendered')}`;
+        playWin(); renderScores();
+        applyEloResult(1);
+        setTimeout(leaveRoom, 3000);
+      }
+      hideMpOverlay(); return;
+    }
+
     if (data.status === 'waiting') {
       document.getElementById('mpStatus').innerHTML=`<div class="spinner"></div>${t('mpWaiting')}`;
       if (myPlayer==='X') { oppElo = oppElo || 1000; }
@@ -1027,6 +1043,7 @@ function leaveRoom() {
   vsOnline=false; myPlayer=null; roomId=null;
   document.getElementById('btn-2p').classList.add('active');
   document.getElementById('btn-online').classList.remove('active');
+  document.getElementById('surrenderBtn').style.display='none';
   resetScores(); firstPlayer='X'; initGame(); applyLang();
 }
 
@@ -1057,6 +1074,7 @@ document.getElementById('btn-2p').addEventListener('click',()=>{
   document.getElementById('btn-ai').classList.remove('active');
   document.getElementById('btn-online').classList.remove('active');
   document.getElementById('diff-row').style.display='none';
+  document.getElementById('surrenderBtn').style.display='none';
   resetScores(); firstPlayer='X'; initGame(); applyLang();
 });
 document.getElementById('btn-ai').addEventListener('click',()=>{
@@ -1066,6 +1084,7 @@ document.getElementById('btn-ai').addEventListener('click',()=>{
   document.getElementById('btn-2p').classList.remove('active');
   document.getElementById('btn-online').classList.remove('active');
   document.getElementById('diff-row').style.display='flex';
+  document.getElementById('surrenderBtn').style.display='none';
   resetScores(); firstPlayer='X'; initGame(); applyLang();
 });
 document.getElementById('btn-online').addEventListener('click', ()=>{
@@ -1074,8 +1093,34 @@ document.getElementById('btn-online').addEventListener('click', ()=>{
   document.getElementById('btn-2p').classList.remove('active');
   document.getElementById('btn-ai').classList.remove('active');
   document.getElementById('diff-row').style.display='none';
+  document.getElementById('surrenderBtn').style.display='block';
   resetScores(); firstPlayer='X'; initGame();
   showMpOverlay(false);
+});
+document.getElementById('mp-btn-nomove').addEventListener('click',()=>{
+  allowMove=false;
+  document.getElementById('mp-btn-nomove').classList.add('active');
+  document.getElementById('mp-btn-move').classList.remove('active');
+  document.getElementById('btn-nomove').classList.add('active');
+  document.getElementById('btn-move').classList.remove('active');
+});
+document.getElementById('mp-btn-move').addEventListener('click',()=>{
+  allowMove=true;
+  document.getElementById('mp-btn-move').classList.add('active');
+  document.getElementById('mp-btn-nomove').classList.remove('active');
+  document.getElementById('btn-move').classList.add('active');
+  document.getElementById('btn-nomove').classList.remove('active');
+});
+document.getElementById('surrenderBtn').addEventListener('click', ()=>{
+  if (!vsOnline || gameOver || !roomRef) return;
+  gameOver = true;
+  scores[myPlayer==='X' ? 'O' : 'X']++;
+  applyEloResult(0);
+  document.getElementById('status').innerHTML =
+    `<span class="ho">🏳️</span> ${t('youSurrendered')}`;
+  renderScores();
+  roomRef.update({ status:'done', surrendered: myPlayer });
+  setTimeout(leaveRoom, 2500);
 });
 document.getElementById('mpSearchBtn').addEventListener('click', startMatchmaking);
 document.getElementById('mpCancelBtn').addEventListener('click',()=>{
@@ -1174,6 +1219,9 @@ const T={
     mpSearching:'Suche nach Gegner…',
     mpWaiting:'Warte auf Gegner…',
     opponentLeft:'Gegner hat das Spiel verlassen. Du gewinnst!',
+    surrender:'Aufgeben',
+    youSurrendered:'Du hast aufgegeben.',
+    opponentSurrendered:'Gegner hat aufgegeben. Du gewinnst!',
     nameTitle:'👤 Dein Spielername',
     nameDesc:'Wird für die Weltrangliste verwendet und auf diesem Gerät gespeichert.',
     nameConfirm:'Bestätigen',
@@ -1213,6 +1261,9 @@ const T={
     mpSearching:'Searching for opponent…',
     mpWaiting:'Waiting for opponent…',
     opponentLeft:'Opponent left. You win!',
+    surrender:'Surrender',
+    youSurrendered:'You surrendered.',
+    opponentSurrendered:'Opponent surrendered. You win!',
     nameTitle:'👤 Your Player Name',
     nameDesc:'Used for the world leaderboard and saved on this device.',
     nameConfirm:'Confirm',
