@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>TicTacToe+ v1.5</title>
+<title>TicTacToe+ v1.6</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body {
@@ -127,7 +127,7 @@
 </head>
 <body>
 
-<h1>TicTacToe+ <span style="font-size:0.55rem;color:#555;letter-spacing:0.05em;vertical-align:middle;">v1.5</span></h1>
+<h1>TicTacToe+ <span style="font-size:0.55rem;color:#555;letter-spacing:0.05em;vertical-align:middle;">v1.6</span></h1>
 <p class="subtitle" id="subtitle">2 Spieler · lokal</p>
 
 <p id="activePlayersText" style="font-size:0.72rem;color:#666;letter-spacing:0.04em;margin-bottom:6px;min-height:16px;"></p>
@@ -834,52 +834,84 @@ async function startMatchmaking() {
 async function tryMatch() {
   const myId = deviceId;
   try {
-    const queueSnap = await db.ref(QUEUE_PATH).get();
-    const queue = queueSnap.val() || {};
-    const candidates = Object.entries(queue).filter(([id,_]) => id !== myId);
+    // Use a transaction on the queue to atomically claim a waiting opponent
+    // or register ourselves as the waiter. This prevents the race condition
+    // where two players click "search" simultaneously and both become hosts.
+    const queueRef = db.ref(QUEUE_PATH);
+    let matchedOpponent = null;
 
-    if (candidates.length > 0) {
-      // Within 5s: prefer closest ELO. After 5s: take first available (already enforced by candidates.length>0 check happening immediately, but we keep ELO sort always since it's free)
-      candidates.sort((a,b) => Math.abs(a[1].elo-myElo) - Math.abs(b[1].elo-myElo));
-      const [oppId, oppData] = candidates[0];
-      const rId = oppData.roomId;
-      currentOpponentId = oppData.deviceId || oppId;
+    const txResult = await queueRef.transaction(current => {
+      const entries = Object.entries(current || {}).filter(([id]) => id !== myId);
+      if (entries.length > 0) {
+        // Claim the best-ELO-match candidate: remove them from the queue
+        entries.sort((a,b) => Math.abs(a[1].elo-myElo) - Math.abs(b[1].elo-myElo));
+        const [oppId, oppData] = entries[0];
+        matchedOpponent = { id: oppId, data: oppData };
+        const updated = { ...(current || {}) };
+        delete updated[oppId];
+        return updated;
+      }
+      // No one waiting: register ourselves
+      const updated = { ...(current || {}) };
+      updated[myId] = { name: myName, elo: myElo, deviceId: myId,
+        roomId: 'room_'+myId+'_'+Date.now(), allowMove: allowMove,
+        ts: Date.now() };
+      return updated;
+    });
+
+    if (matchedOpponent) {
+      // We are the guest (O), joining an existing room
+      const oppData = matchedOpponent.data;
+      currentOpponentId = oppData.deviceId || matchedOpponent.id;
       rematchCount = 1;
-      await db.ref(`${QUEUE_PATH}/${oppId}`).remove();
-      myPlayer='O'; roomId=rId;
-      listenToRoom(rId, oppData.elo, oppData.name);
+      myPlayer='O'; roomId=oppData.roomId;
+      // Enforce matching move-rule setting
+      if (oppData.allowMove !== undefined && oppData.allowMove !== allowMove) {
+        document.getElementById('mpStatus').innerHTML =
+          `<span style="color:#ff6a6a">⚠️ ${t('ruleMismatch')}</span>`;
+        setTimeout(()=>showMpOverlay(false), 2000);
+        return;
+      }
+      listenToRoom(roomId, oppData.elo, oppData.name);
       return;
     }
 
-    // No one waiting -> become the host, wait
-    const rId = 'room_' + myId + '_' + Date.now();
+    // We registered ourselves as host (X) — find our own queue entry's roomId
+    const mySnap = await queueRef.child(myId).get();
+    const myQueueData = mySnap.val();
+    const rId = myQueueData.roomId;
     myPlayer='X'; roomId=rId;
-    searchingRef = db.ref(`${QUEUE_PATH}/${myId}`);
-    await searchingRef.set({ name: myName, elo: myElo, roomId: rId, deviceId: deviceId, ts: firebase.database.ServerValue.TIMESTAMP });
+    searchingRef = queueRef.child(myId);
     const initState = serializeState();
     initState.status = 'waiting';
     initState.hostName = myName; initState.hostElo = myElo; initState.hostDeviceId = deviceId;
+    initState.allowMove = allowMove;
     await db.ref(`${ROOMS_PATH}/${rId}`).set(initState);
     oppName = ''; oppElo = 1000; currentOpponentId = null; rematchCount = 1;
     listenToRoom(rId, null, null);
 
-    // After 5 seconds, if still waiting, widen search (re-check queue once more,
-    // accept ANY opponent regardless of ELO gap — already default behavior above,
-    // this timer mainly re-triggers a fresh queue scan in case timing was missed)
+    // After 5 seconds, if still waiting, widen search to accept ANY opponent
     mmTimer = setTimeout(async () => {
       if (!roomRef) return; // already matched/left
-      const qSnap = await db.ref(QUEUE_PATH).get();
-      const q = qSnap.val() || {};
-      const others = Object.entries(q).filter(([id]) => id !== myId);
-      if (others.length > 0) {
-        others.sort((a,b) => Math.abs(a[1].elo-myElo) - Math.abs(b[1].elo-myElo));
-        const [oppId, oppData] = others[0];
-        // Cancel my own waiting room & queue entry, join opponent's instead
-        await searchingRef.remove();
+      const txResult2 = await queueRef.transaction(current => {
+        const entries = Object.entries(current || {}).filter(([id]) => id !== myId);
+        if (entries.length > 0) {
+          entries.sort((a,b) => Math.abs(a[1].elo-myElo) - Math.abs(b[1].elo-myElo));
+          const [oppId] = entries[0];
+          const updated = { ...(current || {}) };
+          delete updated[oppId];
+          delete updated[myId];
+          matchedOpponent = { id: oppId, data: current[oppId] };
+          return updated;
+        }
+        return current;
+      });
+      if (matchedOpponent && matchedOpponent.id) {
+        const oppData = matchedOpponent.data;
         await db.ref(`${ROOMS_PATH}/${roomId}`).remove();
-        await db.ref(`${QUEUE_PATH}/${oppId}`).remove();
         if (roomListener && roomRef) { roomRef.off('value', roomListener); roomListener=null; }
         myPlayer='O'; roomId=oppData.roomId;
+        currentOpponentId = oppData.deviceId || matchedOpponent.id;
         listenToRoom(oppData.roomId, oppData.elo, oppData.name);
       }
     }, 5000);
@@ -1294,6 +1326,7 @@ const T={
     opponentSurrendered:'Gegner hat aufgegeben. Du gewinnst!',
     rematch:'Nochmal',
     endGame:'Beenden',
+    ruleMismatch:'Regeleinstellung stimmt nicht überein. Bitte gleiche Einstellung wählen und erneut suchen.',
     nameTitle:'👤 Dein Spielername',
     nameDesc:'Wird für die Weltrangliste verwendet und auf diesem Gerät gespeichert.',
     nameConfirm:'Bestätigen',
@@ -1338,6 +1371,7 @@ const T={
     opponentSurrendered:'Opponent surrendered. You win!',
     rematch:'Rematch',
     endGame:'End',
+    ruleMismatch:'Rule settings do not match. Please select the same setting and search again.',
     nameTitle:'👤 Your Player Name',
     nameDesc:'Used for the world leaderboard and saved on this device.',
     nameConfirm:'Confirm',
